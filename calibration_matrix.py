@@ -93,7 +93,7 @@ else:
     else:
         print("\n🚨 [실패] 패턴 인식 성공 사진이 너무 적습니다. 조명이나 각도를 바꿔서 다시 찍어주세요!")
 
-'''
+
 
 import cv2
 import numpy as np
@@ -150,7 +150,7 @@ while cap.isOpened():
 
 cap.release()
 cv2.destroyAllWindows()
-'''
+
 
 import cv2
 import numpy as np
@@ -208,3 +208,114 @@ while cap.isOpened():
 cap.release()
 cv2.destroyAllWindows()
 '''
+
+#!/usr/bin/env python3
+import cv2
+import numpy as np
+import os
+
+def main():
+    # 1. 캘리브레이션 행렬 로드 (1280x720 기준)
+    npz_path = 'calibration_matrix.npz'
+    if not os.path.exists(npz_path):
+        print(f"❌ '{npz_path}' 파일이 현재 경로에 없습니다.")
+        return
+
+    with np.load(npz_path) as X:
+        mtx, dist = [X[i] for i in ('mtx', 'dist')]
+    print("✅ 왜곡 다림질 수식 장전 완료!")
+
+    # 2. RTSP 고정형 IP 카메라 연결
+    RTSP_URL = "rtsp://admin:kue0504950!@192.168.0.30:554/onvif1"
+    cap = cv2.VideoCapture(RTSP_URL)
+
+    if not cap.isOpened():
+        print("❌ RTSP 스트림을 열 수 없습니다.")
+        return
+
+    w, h = 1280, 720
+    newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 1, (w, h))
+    mapx, mapy = cv2.initUndistortRectifyMap(mtx, dist, None, newcameramtx, (w, h), cv2.CV_32FC1)
+
+    print("\n=== 🔵 실시간 파란색 물병(Bottle) 좌표 추적 시작 ===")
+    print("👉 딥러닝 없는 초고속 고전 비전 (Delay: 0.0초)")
+    print("👉 [알파벳 q]: 스트리밍 종료\n")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            print("❌ 프레임을 유실했습니다.")
+            break
+
+        # [단계 1] 전처리 (1280x720 리사이즈 -> 180도 회전 -> 왜곡 다림질)
+        resized_frame = cv2.resize(frame, (w, h))
+        rotated_frame = cv2.rotate(resized_frame, cv2.ROTATE_180)
+        undistorted_frame = cv2.remap(rotated_frame, mapx, mapy, cv2.INTER_LINEAR)
+
+        # [단계 2] BGR 색상계를 인간의 눈과 비슷한 HSV 색상계로 변환
+        hsv_frame = cv2.cvtColor(undistorted_frame, cv2.COLOR_BGR2HSV)
+
+        # [단계 3] '파란색'에 해당하는 HSV 색상 범위 지정
+        # (만약 파란색이 안 잡히면 이 수치를 미세 조정해야 합니다)
+        lower_blue = np.array([90, 80, 50])   # 파란색의 하한값
+        upper_blue = np.array([130, 255, 255]) # 파란색의 상한값
+
+        # 지정한 범위의 색상만 남기고 나머지는 흑백(Mask)으로 쳐냅니다.
+        mask = cv2.inRange(hsv_frame, lower_blue, upper_blue)
+
+        # 노이즈(작은 파란색 점들) 제거를 위한 모폴로지 연산 (다듬기)
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # [단계 4] 살아남은 파란색 덩어리(Contour)들의 외곽선 찾기
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        target_u, target_v = 0, 0 # 목표 픽셀 좌표 초기화
+
+        if contours:
+            # 가장 면적이 큰 파란색 덩어리를 물병으로 간주합니다.
+            largest_contour = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
+
+            # 면적이 너무 작은 노이즈(예: 500픽셀 이하)는 무시
+            if area > 500: 
+                # 외곽선에 딱 맞는 네모 박스 그리기
+                x, y, w_box, h_box = cv2.boundingRect(largest_contour)
+                cv2.rectangle(undistorted_frame, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
+
+                # 무게 중심(Moment) 수학적 연산으로 물병의 정중앙 픽셀(u, v) 좌표 추출!
+                M = cv2.moments(largest_contour)
+                if M["m00"] > 0:
+                    target_u = int(M["m10"] / M["m00"])
+                    target_v = int(M["m01"] / M["m00"])
+
+                    # 정중앙 픽셀에 빨간색 점 찍기
+                    cv2.circle(undistorted_frame, (target_u, target_v), 5, (0, 0, 255), -1)
+                    
+                    # 화면에 추출된 좌표 출력 (이 좌표가 바로 로봇으로 넘길 데이터입니다!)
+                    cv2.putText(undistorted_frame, f"Bottle (u:{target_u}, v:{target_v})", 
+                                (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # [출력] 메인 화면과 컴퓨터의 뇌가 보는 흑백 마스크 화면을 나란히 출력
+        mask_colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) # 가로로 붙이기 위해 채널 맞춤
+        
+        # 화면이 너무 크면 보기 힘드니 절반(640x360)으로 줄여서 모니터링
+        view_main = cv2.resize(undistorted_frame, (640, 360))
+        view_mask = cv2.resize(mask_colored, (640, 360))
+        
+        cv2.putText(view_mask, "AI Mask (Blue Only)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 두 화면 이어 붙이기
+        combined_view = cv2.hconcat([view_main, view_mask])
+        cv2.imshow("High-Speed Bottle Tracking", combined_view)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("🛑 스트리밍 종료")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
